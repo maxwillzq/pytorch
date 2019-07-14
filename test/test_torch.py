@@ -1695,7 +1695,10 @@ class _TestTorchMixin(object):
         m2 = torch.tensor([True, True, False, False, False, True], dtype=torch.bool)
         self.assertEqual(m1 + m2, torch.tensor([True, True, False, True, False, True], dtype=torch.bool))
 
-        # [res] torch.add([res,] tensor1, value, tensor2)
+        # bfloat16
+        m1 = torch.tensor([1, 2], dtype=torch.bfloat16)
+        m2 = torch.tensor([3, 4], dtype=torch.bfloat16)
+        self.assertEqual(m1 + m2, torch.tensor([4, 6], dtype=torch.bfloat16))
 
     def test_csub(self):
         # with a tensor
