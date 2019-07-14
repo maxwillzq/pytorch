@@ -1818,6 +1818,11 @@ class _TestTorchMixin(object):
             a2 = torch.tensor([True, False, True, False], dtype=torch.bool, device=device)
             self.assertEqual(a1 * a2, torch.tensor([True, False, False, False], dtype=torch.bool, device=device))
 
+            if device == 'cpu':
+                a1 = torch.tensor([1, 2], dtype=torch.bfloat16, device=device)
+                a2 = torch.tensor([3, 4], dtype=torch.bfloat16, device=device)
+                self.assertEqual(a1 * a2, torch.tensor([3, 6], dtype=torch.bfloat16, device=device))
+
     def test_div(self):
         m1 = torch.randn(10, 10)
         res1 = m1.clone()
