@@ -2,35 +2,19 @@
 
 #include <functional>
 
+#include <c10/core/DeviceGuard.h>
 #include <c10/util/Exception.h>
 #include <torch/csrc/autograd/engine.h>
 #include <torch/csrc/autograd/function_hook.h>
 #include <torch/csrc/autograd/functions/accumulate_grad.h>
 #include <torch/csrc/autograd/profiler.h>
+#include <torch/csrc/autograd/utils/lambda_post_hook.h>
+#include <torch/csrc/distributed/c10d/comm.h>
 #include <torch/csrc/utils/hash.h>
 #include <torch/csrc/utils/memory.h>
 
 namespace c10d {
 namespace {
-
-// Turns lambda without input/output into a torch::autograd::FunctionPostHook.
-class LambdaPostHook : public torch::autograd::FunctionPostHook {
-  using variable_list = std::vector<torch::autograd::Variable>;
-
- public:
-  /* implicit */ LambdaPostHook(std::function<void(void)> fn)
-      : fn_(std::move(fn)) {}
-
-  variable_list operator()(
-      const variable_list& outputs,
-      const variable_list& /* unused */) override {
-    fn_();
-    return outputs;
-  }
-
- protected:
-  std::function<void(void)> fn_;
-};
 
 inline int64_t current_time_in_nanos() {
   return torch::autograd::profiler::getTime();
@@ -42,7 +26,8 @@ Reducer::Reducer(
     std::vector<std::vector<torch::autograd::Variable>> replicas,
     std::vector<std::vector<size_t>> bucket_indices,
     std::shared_ptr<c10d::ProcessGroup> process_group,
-    std::vector<std::vector<bool>> expect_sparse_gradients)
+    std::vector<std::vector<bool>> expect_sparse_gradients,
+    int64_t bucket_bytes_cap)
     : replicas_(std::move(replicas)),
       process_group_(std::move(process_group)),
       expect_sparse_gradients_(std::move(expect_sparse_gradients)),
@@ -50,7 +35,11 @@ Reducer::Reducer(
       require_finalize_(false),
       next_bucket_(0),
       has_marked_unused_parameters_(false),
-      backward_stats_base_(0) {
+      local_used_maps_reduced_(false),
+      backward_stats_base_(0),
+      has_rebuilt_bucket_(false),
+      bucket_bytes_cap_(bucket_bytes_cap) {
+  C10_LOG_API_USAGE_ONCE("torch.distributed.ddp.reducer");
   TORCH_CHECK(replicas_.size() >= 1, "Expected at least one model replica.");
   TORCH_CHECK(replicas_[0].size() >= 1, "Expected at least one parameter.");
 
@@ -131,8 +120,13 @@ Reducer::Reducer(
 
         // Hook to execute after the gradient accumulator has executed.
         hooks_.emplace_back(
-            grad_accumulator->add_post_hook(torch::make_unique<LambdaPostHook>(
-                [=] { this->autograd_hook(index); })),
+            grad_accumulator->add_post_hook(
+                torch::make_unique<torch::autograd::utils::LambdaPostHook>(
+                    [=](const torch::autograd::variable_list& outputs,
+                        const torch::autograd::variable_list& /* unused */) {
+                      this->autograd_hook(index);
+                      return outputs;
+                    })),
             grad_accumulator);
 
         // Map raw function pointer to replica index and parameter index.
@@ -158,6 +152,35 @@ Reducer::Reducer(
         backward_stats_.begin(),
         backward_stats_.end(),
         [=](std::vector<int64_t>& v) { v.resize(variable_count); });
+  }
+
+  // Initialize locally used parameter maps
+  {
+    const auto replica_count = replicas_.size();
+    const auto variable_count = replicas_[0].size();
+    local_used_maps_.resize(replica_count);
+    local_used_maps_dev_.resize(replica_count);
+
+    for (size_t i = 0; i < replica_count; i++) {
+      at::TensorOptions options, options_host;
+      options = options.dtype(at::kInt);
+
+      if (replicas_[i][0].is_cuda()) {
+        at::DeviceGuard g(replicas_[i][0].device());
+        local_used_maps_[i] = at::zeros(
+            {static_cast<long>(variable_count)}, options.pinned_memory(true));
+      } else {
+        local_used_maps_[i] =
+            at::zeros({static_cast<long>(variable_count)}, options);
+      }
+
+      // This tensor needs to be on the same device as replica because backend
+      // such as NCCL may not support CPU tensors, and hence it might not work
+      // if we always put it on CPU.
+      options = options.device(replicas_[i][0].device());
+      local_used_maps_dev_[i] =
+          at::empty({static_cast<long>(variable_count)}, options);
+    }
   }
 }
 
@@ -238,12 +261,33 @@ void Reducer::mark_variable_ready_sparse(VariableIndex index) {
 // This function is only to be called from the autograd thread.
 void Reducer::autograd_hook(VariableIndex index) {
   std::lock_guard<std::mutex> lock(this->mutex_);
+  // Since it gets here, this param has been used for this iteration. We want
+  // to mark it in local_used_maps_. During no_sync session, the same var can
+  // be set multiple times, which is OK as does not affect correctness. As long
+  // as it is used once during no_sync session, it is marked as used.
+  local_used_maps_[index.replica_index][index.variable_index] = 1;
 
   // Ignore if we don't expect to be called.
   // This may be the case if the user wants to accumulate gradients
   // for number of iterations before reducing them.
   if (!expect_autograd_hooks_) {
     return;
+  }
+
+  // Rebuild bucket only if 1) it is the first time to rebuild bucket 2)
+  // unused_parameters_ is empty, currently it does not support when there are
+  // unused parameters 3) this backward pass needs to run allreduce. Here, we
+  // just dump tensors and their parameter indices into rebuilt_params_ and
+  // rebuilt_param_indices_ based on gradient arriving order, and then at the
+  // end of finalize_backward(), buckets will be rebuilt based on
+  // rebuilt_params_ and rebuilt_param_indices_, and then will be broadcasted
+  // and intialized. Also we only need to dump tensors and parameter indcies of
+  // one replica.
+  if (!has_rebuilt_bucket_ && unused_parameters_.empty() &&
+      index.replica_index == 0) {
+    rebuilt_params_.push_back(
+        replicas_[index.replica_index][index.variable_index]);
+    rebuilt_param_indices_.push_back(index.variable_index);
   }
 
   // If there are model parameters that went unused when computing the model
@@ -284,26 +328,34 @@ void Reducer::mark_variable_ready(VariableIndex index) {
   // Something is wrong if all variables contained in this bucket replica have
   // already been marked as ready.
   if (replica.pending == 0) {
-    // Receiving a call to `mark_variable_ready` twice for the same variable
-    // is only possible if the variable was initially deemed unused, and was
-    // marked ready from the `prepare_for_backward` function, only to become
-    // part of the autograd graph at a later point in time.
-    TORCH_INTERNAL_ASSERT(has_marked_unused_parameters_);
-    TORCH_CHECK(
-        false,
+    const auto common_error = c10::str(
         "Expected to mark a variable ready only once. ",
         "",
-        "This error is caused by use of a module parameter outside the ",
-        "`forward` function. The return value of the `forward` function ",
-        "is inspected by the distributed data parallel wrapper to figure ",
-        "out if any of the module's parameters went unused. If this is the ",
-        "case, it knows they won't receive gradients in a backward pass. ",
-        "If any of those parameters are then used outside `forward`, this ",
-        "error condition is triggered. ",
-        "",
-        "You can disable unused parameter detection by passing the keyword "
-        "argument `find_unused_parameters=False` to ",
+        "This error is caused by one of the following reasons: ",
+        "1) Use of a module parameter outside the `forward` function. ",
+        "Please make sure model parameters are not shared across multiple ",
+        "concurrent forward-backward passes",
+        "2) Reused parameters in multiple reentrant backward passes. For ",
+        "example, if you use multiple `checkpoint` functions to wrap the ",
+        "same part of your model, it would result in the same set of ",
+        "parameters been used by different reentrant backward passes ",
+        "multiple times, and hence marking a variable ready multiple times. ",
+        "DDP does not support such use cases yet.");
+    TORCH_CHECK(
+        has_marked_unused_parameters_,
+        common_error,
+        "3) Incorrect unused parameter detection. The return value of the ",
+        "`forward` function is inspected by the distributed data parallel ",
+        "wrapper to figure out if any of the module's parameters went ",
+        "unused. For unused parameters, DDP would not expect gradients from ",
+        "then. However, if an unused parameter becomes part of the autograd ",
+        "graph at a later point in time (e.g., in a reentrant backward when ",
+        "using `checkpoint`), the gradient will show up unexpectedly. If all ",
+        "parameters in the model participate in the backward pass, you can ",
+        "disable unused parameter detection by passing the keyword argument ",
+        "`find_unused_parameters=False` to ",
         "`torch.nn.parallel.DistributedDataParallel`.");
+    TORCH_CHECK(!has_marked_unused_parameters_, common_error);
   }
 
   if (bucket.expect_sparse_gradient) {
@@ -328,11 +380,30 @@ void Reducer::mark_variable_ready(VariableIndex index) {
     }
   }
 
-  // Run finalizer function once the final bucket was marked ready.
+  // Run finalizer function and kick off reduction for local_used_maps once the
+  // final bucket was marked ready.
   if (next_bucket_ == buckets_.size()) {
+    // H2D from local_used_maps_ to local_used_maps_dev_
+    for (size_t i = 0; i < local_used_maps_.size(); i++) {
+      // We do async H2D to avoid the blocking overhead. The async copy and
+      // allreduce respect the current stream, so will be sequenced correctly.
+      local_used_maps_dev_[i].copy_(local_used_maps_[i], true);
+    }
+    local_used_work_ = process_group_->allreduce(local_used_maps_dev_);
+
     torch::autograd::Engine::get_default_engine().queue_callback([=] {
-      std::lock_guard<std::mutex> lock(this->mutex_);
+      std::unique_lock<std::mutex> lock(this->mutex_);
       this->finalize_backward();
+      // Rebuild bucket if this is the first time to rebuild
+      if (!rebuilt_params_.empty()) {
+        auto rebuilt_bucket_indices = rebuildBuckets();
+        // Unlock before initialize_buckets() as initialize_buckets() requires a
+        // lock, it could result in self deadlock without unlocking here.
+        lock.unlock();
+        initialize_buckets(std::move(rebuilt_bucket_indices));
+      } else {
+        lock.unlock();
+      }
     });
   }
 }
@@ -475,6 +546,7 @@ void Reducer::initialize_buckets(
           .intra_bucket_index = intra_bucket_index++,
       };
     }
+    bucket.variable_indices = std::move(bucket_indices[bucket_index]);
 
     buckets_.push_back(std::move(bucket));
   }
@@ -575,20 +647,61 @@ void Reducer::prepare_for_backward(
 
 // A bucket with one or more dense tensors needs to be unflattened.
 void Reducer::finalize_bucket_dense(Bucket& bucket) {
-  for (auto& replica : bucket.replicas) {
+  for (size_t replica_index = 0; replica_index < bucket.replicas.size();
+       replica_index++) {
+    auto& replica = bucket.replicas[replica_index];
     for (size_t intra_bucket_index = 0;
          intra_bucket_index < replica.variables.size();
          intra_bucket_index++) {
       auto& variable = replica.variables[intra_bucket_index];
       const auto offset = replica.offsets[intra_bucket_index];
       const auto length = replica.lengths[intra_bucket_index];
+
+      // Determine if this param has been used globally or not.
+      //
+      // If the variable was used locally, it is also used globally and then
+      // we don't need to wait for the reduction. Otherwise we lazily wait for
+      // the reduction to complete, only when we see a variable that was unused
+      // locally. Then we end up delaying the synchronization point that
+      // local_used_work_->wait() implies. If we don't have any unused
+      // parameters at all, we can skip waiting for the work to complete
+      // altogether, and cause negligible performance overhead for models where
+      // all parameters are used. Such lazily waiting means minimizing
+      // performance impact for the big majority of models where all parameters
+      // are always used. Then we only pay the overhead cost if there is indeed
+      // a parameter that is locally unused, because we need to check if it's
+      // also globally unused.
+      size_t variable_index = bucket.variable_indices[intra_bucket_index];
+      // Note: global_unused might not be global yet. As we lazily wait for the
+      // reduction to complete, it becomes really global only if we get to the
+      // point as below where we wait for the reduction work, make D2H copy,
+      // and update global_unused with the real global consensus, i.e.
+      // local_used_maps_reduced_ is true.
+      bool global_unused =
+          local_used_maps_[replica_index][variable_index].item<int>() == 0;
+      if (global_unused && !local_used_maps_reduced_) {
+        // Wait for local_used_maps reduction to complete.
+        local_used_work_->wait();
+        // D2H from local_used_maps_dev_ to local_used_maps_
+        for (size_t i = 0; i < local_used_maps_.size(); i++) {
+          local_used_maps_[i].copy_(local_used_maps_dev_[i]);
+        }
+        global_unused =
+            local_used_maps_[replica_index][variable_index].item<int>() == 0;
+        local_used_maps_reduced_ = true;
+      }
+
       auto bucket_view =
           replica.contents.narrow(0, offset, length).view(variable.sizes());
       auto& grad = variable.grad();
-      if (!grad.defined()) {
-        grad = at::empty(bucket_view.sizes(), bucket_view.options());
+
+      // If a parameter is globally unused, we keep its grad untouched.
+      if (!global_unused) {
+        if (!grad.defined()) {
+          grad = at::empty(bucket_view.sizes(), bucket_view.options());
+        }
+        grad.copy_(bucket_view);
       }
-      grad.copy_(bucket_view);
     }
   }
 }
@@ -628,6 +741,122 @@ void Reducer::finalize_backward() {
       finalize_bucket_dense(bucket);
     }
   }
+
+  // Reset unused parameter accounting.
+  for (auto& local_used : local_used_maps_) {
+    local_used.fill_(0);
+  }
+  // Due to the lazy wait, it is possible that reduction of the current
+  // iteration is still going when the one for next iteration gets kicked off.
+  // For such case, we want to wait explicitly to make sure the reduction does
+  // complete before kicking off next one. Otherwise the previous one may
+  // interfere, write to the device-side memory and clobber the content of
+  // local_unused_maps_dev_.
+  if (!local_used_maps_reduced_) {
+    local_used_work_->wait();
+  }
+  local_used_maps_reduced_ = false;
+}
+
+void Reducer::sync_bucket_indices(
+    std::vector<std::vector<size_t>>& bucket_indices) {
+  auto num_buckets = bucket_indices.size();
+  std::vector<size_t> bucket_sizes;
+  bucket_sizes.reserve(num_buckets);
+  int64_t total_size = 0;
+  for (size_t i = 0; i < num_buckets; i++) {
+    auto bucket_size = bucket_indices.at(i).size();
+    bucket_sizes.push_back(bucket_size);
+    total_size += bucket_size;
+  }
+
+  at::TensorOptions options;
+  options = options.dtype(at::kInt);
+  options = options.device(replicas_[0][0].device());
+
+  // Group indices and num_bucket together into indices_tensor
+  // Broadcast this tensor first, as its size is equal among all processes
+  auto indices_tensor = at::empty({total_size + 1}, at::kInt);
+  auto indices_accessor = indices_tensor.accessor<int, 1>();
+  auto indices_accessor_Index = 0;
+  for (size_t i = 0; i < num_buckets; i++) {
+    const auto& bucket_size = bucket_indices.at(i).size();
+    for (size_t j = 0; j < bucket_size; j++) {
+      indices_accessor[indices_accessor_Index++] = bucket_indices[i][j];
+    }
+  }
+  indices_accessor[indices_accessor_Index] = num_buckets;
+
+  // Copy CPU tensor to device tensor, as the process_group_ could be NCCL and
+  // it can only broadcast device tensors.
+  auto indices_tensor_device = at::empty({total_size + 1}, options);
+  indices_tensor_device.copy_(indices_tensor, true);
+  std::vector<at::Tensor> indices_tensor_list = {indices_tensor_device};
+  process_group_->broadcast(indices_tensor_list)->wait();
+  indices_tensor.copy_(indices_tensor_list.front());
+
+  // Update num_buckets after receiving it from rank 0
+  num_buckets = indices_accessor[indices_accessor_Index];
+
+  // Broadcast bucket_sizes
+  auto bucket_sizes_tensor = at::empty({(int64_t)num_buckets}, at::kInt);
+  auto bucket_sizes_accessor = bucket_sizes_tensor.accessor<int, 1>();
+  for (size_t i = 0; i < num_buckets; i++) {
+    // For rank != 0, it is possible that local num buckets bucket_sizes.size()
+    // is smaller than broadcasted num_buckets
+    bucket_sizes_accessor[i] =
+        bucket_sizes.at(std::min(i, (bucket_sizes.size() - 1)));
+  }
+  auto bucket_sizes_tensor_device = at::empty({(int64_t)num_buckets}, options);
+  bucket_sizes_tensor_device.copy_(bucket_sizes_tensor, true);
+  std::vector<at::Tensor> bucket_sizes_tensor_list = {
+      bucket_sizes_tensor_device};
+  process_group_->broadcast(bucket_sizes_tensor_list)->wait();
+  bucket_sizes_tensor.copy_(bucket_sizes_tensor_list.front());
+
+  // Clear bucket_indices first, and then update bucket_indices using received
+  // num_buckets, bucket_sizes_tensor and indices_tensor from rank 0
+  bucket_indices.clear();
+  bucket_indices.reserve(num_buckets);
+  indices_accessor_Index = 0;
+  for (size_t i = 0; i < num_buckets; i++) {
+    const auto& bucket_size = bucket_sizes_accessor[i];
+    std::vector<size_t> bucket;
+    bucket.reserve(bucket_size);
+    for (size_t j = 0; j < bucket_size; j++) {
+      bucket.push_back(indices_accessor[indices_accessor_Index++]);
+    }
+    bucket_indices.emplace_back(std::move(bucket));
+  }
+}
+
+std::vector<std::vector<size_t>> Reducer::rebuildBuckets() {
+  TORCH_INTERNAL_ASSERT(
+      rebuilt_params_.size() == rebuilt_param_indices_.size(),
+      "rebuilt parameter tensors size is not same as rebuilt parameter indices size.");
+  TORCH_INTERNAL_ASSERT(
+      replicas_[0].size() == rebuilt_param_indices_.size(),
+      "rebuilt parameter indices size is not same as original model parameters size.");
+  std::vector<std::vector<size_t>> rebuilt_bucket_indices;
+  std::vector<size_t> bucket_size_limits;
+  bucket_size_limits.push_back(kDefaultFirstBucketBytes);
+  bucket_size_limits.push_back(bucket_bytes_cap_);
+  rebuilt_bucket_indices = compute_bucket_assignment_by_size(
+      rebuilt_params_,
+      bucket_size_limits,
+      expect_sparse_gradients_[0],
+      rebuilt_param_indices_);
+
+  // For rebuilt bucket indices, it needs to be synced across all ranks.
+  // Broadcast the newly rebuilt bucket indices from rank 0 in default.
+  // After syncing up rebuilt bucket indices, initialize buckets for reducer.
+  sync_bucket_indices(rebuilt_bucket_indices);
+
+  has_rebuilt_bucket_ = true;
+  rebuilt_params_.clear();
+  rebuilt_param_indices_.clear();
+
+  return rebuilt_bucket_indices;
 }
 
 namespace {
@@ -657,10 +886,14 @@ inline bool operator==(const BucketKey& lhs, const BucketKey& rhs) {
 // This is equivalent to take_tensors but returns indices into the
 // tensor list argument for bucket assignment. Also, it is aware
 // of device placement and will not allow buckets to span devices.
+// The index of tensors[i] assigned to bucket is tensor_indices[i],
+// when tensor_indices is empty, the index of tensors[i] assigned to
+// bucket is i.
 std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
     const std::vector<at::Tensor>& tensors,
     const std::vector<size_t>& bucket_size_limits,
-    const std::vector<bool>& expect_sparse_gradient) {
+    const std::vector<bool>& expect_sparse_gradient,
+    const std::vector<int64_t>& tensor_indices) {
   // Either expect_sparse_gradient is not specified or it has as many elements
   // as the vector with tensors.
   TORCH_INTERNAL_ASSERT(
@@ -693,16 +926,23 @@ std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
     const auto& tensor = tensors[i];
     TORCH_CHECK(!tensor.is_sparse(), "No support for sparse tensors.");
 
+    // when tensor_indices is empty, the index of tensors[i] assigned to
+    // bucket is i, otherwise the tensor index is tensor_indices[i].
+    auto tensor_index = i;
+    if (!tensor_indices.empty()) {
+      tensor_index = tensor_indices[i];
+    }
     // If we expect a sparse gradient to be produced for this tensor, it cannot
     // be grouped together with other gradients and gets its own bucket.
-    if (!expect_sparse_gradient.empty() && expect_sparse_gradient[i]) {
-      result.push_back({i});
+    if (!expect_sparse_gradient.empty() &&
+        expect_sparse_gradient[tensor_index]) {
+      result.push_back({tensor_index});
       continue;
     }
 
     auto key = BucketKey(tensor.scalar_type(), tensor.device());
     auto& bucket = buckets[key];
-    bucket.indices.push_back(i);
+    bucket.indices.push_back(tensor_index);
     bucket.size += tensor.numel() * tensor.element_size();
 
     // Initialize bucket size limit iterator if necessary.
@@ -732,18 +972,23 @@ std::vector<std::vector<size_t>> compute_bucket_assignment_by_size(
     }
   }
 
-  // Sort resulting buckets by the minimum tensor index they include.
-  // We assume that the order of the tensors is the order in which they are
-  // used (or the reverse order in which their gradients are produced).
-  // This sorting step ensures that the buckets are ready in consecutive order.
-  std::sort(
-      result.begin(),
-      result.end(),
-      [](const std::vector<size_t>& a, const std::vector<size_t>& b) {
-        const auto amin = std::min_element(a.begin(), a.end());
-        const auto bmin = std::min_element(b.begin(), b.end());
-        return *amin < *bmin;
-      });
+  // If tensor_indices is not empty, the order of the tensors is in the gradient
+  // ready order, so no need to sort.
+  // If tensor_indices is empty, sort resulting buckets by the minimum tensor
+  // index they include. We assume that the order of the tensors is the order in
+  // which they are used (or the reverse order in which their gradients are
+  // produced). This sorting step ensures that the buckets are ready in
+  // consecutive order.
+  if (tensor_indices.empty()) {
+    std::sort(
+        result.begin(),
+        result.end(),
+        [](const std::vector<size_t>& a, const std::vector<size_t>& b) {
+          const auto amin = std::min_element(a.begin(), a.end());
+          const auto bmin = std::min_element(b.begin(), b.end());
+          return *amin < *bmin;
+        });
+  }
 
   return result;
 }

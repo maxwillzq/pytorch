@@ -1,12 +1,18 @@
 #pragma once
 
+// DO NOT DEFINE STATIC DATA IN THIS HEADER!
+// See Note [Do not compile initializers with AVX]
+
 #include <ATen/cpu/vec256/intrinsics.h>
 
 #include <ATen/cpu/vec256/vec256_base.h>
 #include <ATen/cpu/vec256/vec256_float.h>
+#include <ATen/cpu/vec256/vec256_bfloat16.h>
 #include <ATen/cpu/vec256/vec256_double.h>
 #include <ATen/cpu/vec256/vec256_int.h>
 #include <ATen/cpu/vec256/vec256_qint.h>
+#include <ATen/cpu/vec256/vec256_std_complex_float.h>
+#include <ATen/cpu/vec256/vec256_std_complex_double.h>
 #include <ATen/cpu/vec256/vec256_complex_float.h>
 #include <ATen/cpu/vec256/vec256_complex_double.h>
 
@@ -46,7 +52,7 @@ std::ostream& operator<<(std::ostream& stream, const Vec256<T>& vec) {
 }
 
 
-#if defined(__AVX__) && !defined(_MSC_VER)
+#if (defined(CPU_CAPABILITY_AVX) || defined(CPU_CAPABILITY_AVX2)) && !defined(_MSC_VER)
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ CAST (AVX) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -60,7 +66,7 @@ inline Vec256<double> cast<double, float>(const Vec256<float>& src) {
   return _mm256_castps_pd(src);
 }
 
-#if defined(__AVX2__)
+#if defined(CPU_CAPABILITY_AVX2)
 
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ CAST (AVX2) ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -86,13 +92,13 @@ DEFINE_FLOAT_INT_CAST(int16_t, float, s)
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ GATHER ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 template<int64_t scale = 1>
-c10::guts::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<double>>
+std::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<double>>
 inline gather(const double* base_addr, const Vec256<int64_t>& vindex) {
   return _mm256_i64gather_pd(base_addr, vindex, scale);
 }
 
 template<int64_t scale = 1>
-c10::guts::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<float>>
+std::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<float>>
 inline gather(const float* base_addr, const Vec256<int32_t>& vindex) {
   return _mm256_i32gather_ps(base_addr, vindex, scale);
 }
@@ -100,14 +106,14 @@ inline gather(const float* base_addr, const Vec256<int32_t>& vindex) {
 // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ MASK GATHER ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 template<int64_t scale = 1>
-c10::guts::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<double>>
+std::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<double>>
 inline mask_gather(const Vec256<double>& src, const double* base_addr,
                    const Vec256<int64_t>& vindex, const Vec256<double>& mask) {
   return _mm256_mask_i64gather_pd(src, base_addr, vindex, mask, scale);
 }
 
 template<int64_t scale = 1>
-c10::guts::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<float>>
+std::enable_if_t<scale == 1 || scale == 2 || scale == 4 || scale == 8, Vec256<float>>
 inline mask_gather(const Vec256<float>& src, const float* base_addr,
                    const Vec256<int32_t>& vindex, const Vec256<float>& mask) {
   return _mm256_mask_i32gather_ps(src, base_addr, vindex, mask, scale);
@@ -221,8 +227,8 @@ inline deinterleave2<float>(const Vec256<float>& a, const Vec256<float>& b) {
                         _mm256_permute2f128_ps(a_grouped, b_grouped, 0b0110001)); // 1, 3.   4 bits apart
 }
 
-#endif  // defined(__AVX2__)
+#endif  // defined(CPU_CAPABILITY_AVX2)
 
-#endif // defined(__AVX__) && !defined(_MSC_VER)
+#endif // (defined(CPU_CAPABILITY_AVX) || defined(CPU_CAPABILITY_AVX2)) && !defined(_MSC_VER)
 
 }}}

@@ -45,7 +45,7 @@ using namespace vec256;
 template <typename traits, std::size_t... INDEX>
 typename traits::ArgsTuple
 dereference_impl(char* C10_RESTRICT data[], const int64_t* strides, int64_t i,
-                 c10::guts::index_sequence<INDEX...>) {
+                 std::index_sequence<INDEX...>) {
   return std::make_tuple(
       *(typename traits::template arg<INDEX>::type*)
         (data[INDEX] + i * strides[INDEX])...);
@@ -54,7 +54,7 @@ dereference_impl(char* C10_RESTRICT data[], const int64_t* strides, int64_t i,
 template <typename traits>
 typename traits::ArgsTuple
 dereference(char* C10_RESTRICT data[], const int64_t* strides, int64_t i) {
-  using Indices = c10::guts::make_index_sequence<traits::arity>;
+  using Indices = std::make_index_sequence<traits::arity>;
   return dereference_impl<traits>(data, strides, i, Indices{});
 }
 
@@ -64,7 +64,7 @@ dereference_vec_impl(char* C10_RESTRICT data[],
                      const typename traits::result_type& opt_scalar,
                      size_t S,
                      int64_t i,
-                     c10::guts::index_sequence<INDEX...>) {
+                     std::index_sequence<INDEX...>) {
   using Vec = typename traits::result_type;
   using scalar_t = typename Vec::value_type;
   return std::make_tuple(
@@ -76,7 +76,7 @@ dereference_vec_impl(char* C10_RESTRICT data[],
 template <typename traits>
 typename traits::ArgsTuple
 dereference_vec(char* C10_RESTRICT data[], const typename traits::result_type& opt_scalar, size_t S, int64_t i) {
-  using Indices = c10::guts::make_index_sequence<traits::arity>;
+  using Indices = std::make_index_sequence<traits::arity>;
   return dereference_vec_impl<traits>(data, opt_scalar, S, i, Indices{});
 }
 
@@ -166,7 +166,7 @@ vectorized_loop(char** C10_RESTRICT data_, int64_t n, int64_t S, func_t&& op, ve
 template <typename traits, typename cb_t>
 static inline void unroll_contiguous_scalar_checks(
     const int64_t* strides,
-    c10::guts::index_sequence<>,
+    std::index_sequence<>,
     cb_t&& cb) {
   cb(0);
 }
@@ -174,25 +174,27 @@ static inline void unroll_contiguous_scalar_checks(
 template <typename traits, typename cb_t, size_t INDEX0, size_t ...INDEX>
 static inline void unroll_contiguous_scalar_checks(
     const int64_t* strides,
-    c10::guts::index_sequence<INDEX0, INDEX...>,
+    std::index_sequence<INDEX0, INDEX...>,
     cb_t&& cb) {
   if (is_contiguous_scalar<traits, INDEX0 + 1>(strides)) {
     cb(INDEX0 + 1);
   } else {
-    unroll_contiguous_scalar_checks<traits>(strides, c10::guts::index_sequence<INDEX...>{}, std::forward<cb_t>(cb));
+    unroll_contiguous_scalar_checks<traits>(strides, std::index_sequence<INDEX...>{}, std::forward<cb_t>(cb));
   }
 }
 
 template <typename func_t>
 void cpu_kernel(TensorIterator& iter, func_t&& op) {
   using traits = function_traits<func_t>;
-  TORCH_INTERNAL_ASSERT(iter.ntensors() >= traits::arity + 1);
+  // this could be extended to work with void return types
+  TORCH_INTERNAL_ASSERT(iter.ninputs() == traits::arity);
+  TORCH_INTERNAL_ASSERT(iter.noutputs() == 1);
 
   iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
     if (is_contiguous<traits>(strides)) {
       basic_loop(data, strides, 0, n, std::forward<func_t>(op));
     } else {
-      using Indices = c10::guts::make_index_sequence<traits::arity>;
+      using Indices = std::make_index_sequence<traits::arity>;
       unroll_contiguous_scalar_checks<traits>(strides, Indices{}, [&](size_t _idx) {
         basic_loop(data, strides, 0, n, std::forward<func_t>(op));
       });
@@ -204,13 +206,15 @@ void cpu_kernel(TensorIterator& iter, func_t&& op) {
 template <typename func_t, typename vec_func_t>
 void cpu_kernel_vec(TensorIterator& iter, func_t&& op, vec_func_t&& vop) {
   using traits = function_traits<func_t>;
-  TORCH_INTERNAL_ASSERT(iter.ntensors() >= traits::arity + 1);
+  // this could be extended to work with void return types
+  TORCH_INTERNAL_ASSERT(iter.ninputs() == traits::arity);
+  TORCH_INTERNAL_ASSERT(iter.noutputs() == 1);
 
   iter.for_each([&](char** data, const int64_t* strides, int64_t n) {
     if (is_contiguous<traits>(strides)) {
       return vectorized_loop(data, n, 0, std::forward<func_t>(op), std::forward<vec_func_t>(vop));
     } else {
-      using Indices = c10::guts::make_index_sequence<traits::arity>;
+      using Indices = std::make_index_sequence<traits::arity>;
       unroll_contiguous_scalar_checks<traits>(strides, Indices{}, [&](size_t idx) {
         if (idx) {
           vectorized_loop(data, n, idx, std::forward<func_t>(op), std::forward<vec_func_t>(vop));
@@ -224,22 +228,57 @@ void cpu_kernel_vec(TensorIterator& iter, func_t&& op, vec_func_t&& vop) {
 }
 
 template <typename func_t>
-void cpu_serial_kernel(TensorIterator& iter, func_t&& op) {
+void cpu_serial_kernel(TensorIterator& iter, func_t&& op, const Range& range) {
   using traits = function_traits<func_t>;
-  TORCH_INTERNAL_ASSERT((std::is_void<typename traits::result_type>::value &&
-    iter.noutputs() == 0 && iter.ntensors() == traits::arity) || (iter.ntensors() >= traits::arity + 1));
+  constexpr bool result_void = std::is_void<typename traits::result_type>::value;
+  TORCH_INTERNAL_ASSERT(iter.ninputs() == traits::arity &&
+                        ((result_void && iter.noutputs() == 0) || (!result_void && iter.noutputs() == 1)));
 
   iter.serial_for_each([&](char** data, const int64_t* strides, int64_t n) {
     if (is_contiguous<traits>(strides)) {
       basic_loop(data, strides, 0, n, std::forward<func_t>(op));
     } else {
-      using Indices = c10::guts::make_index_sequence<traits::arity>;
+      using Indices = std::make_index_sequence<traits::arity>;
       unroll_contiguous_scalar_checks<traits>(strides, Indices{}, [&](size_t _idx) {
         basic_loop(data, strides, 0, n, std::forward<func_t>(op));
       });
     }
-  }, {0, iter.numel()});
+  }, range);
   iter.cast_outputs();
+}
+
+template <typename func_t>
+void cpu_serial_kernel(TensorIterator& iter, func_t&& op) {
+  cpu_serial_kernel(iter, op, {0, iter.numel()});
+}
+
+template <typename func_t, typename vec_func_t>
+void cpu_serial_kernel_vec(TensorIterator& iter, func_t&& op, vec_func_t&& vop, const Range& range) {
+  using traits = function_traits<func_t>;
+  // this could be extended to work with void return types
+  TORCH_INTERNAL_ASSERT(iter.ninputs() == traits::arity);
+  TORCH_INTERNAL_ASSERT(iter.noutputs() == 1);
+
+  iter.serial_for_each([&](char** data, const int64_t* strides, int64_t n) {
+    if (is_contiguous<traits>(strides)) {
+      return vectorized_loop(data, n, 0, std::forward<func_t>(op), std::forward<vec_func_t>(vop));
+    } else {
+      using Indices = std::make_index_sequence<traits::arity>;
+      unroll_contiguous_scalar_checks<traits>(strides, Indices{}, [&](size_t idx) {
+        if (idx) {
+          vectorized_loop(data, n, idx, std::forward<func_t>(op), std::forward<vec_func_t>(vop));
+        } else {
+          basic_loop(data, strides, 0, n, std::forward<func_t>(op));
+        }
+      });
+    }
+  }, range);
+  iter.cast_outputs();
+}
+
+template <typename func_t, typename vec_func_t>
+void cpu_serial_kernel_vec(TensorIterator& iter, func_t&& op, vec_func_t&& vop) {
+  cpu_serial_kernel_vec(iter, op, vop, {0, iter.numel()});
 }
 
 }}}  // namespace at::native::<anonymous>
